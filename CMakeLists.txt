@@ -11,7 +11,16 @@ endif()
 
 project("Chocolate Doom" VERSION 3.0.0 LANGUAGES C CXX)
 enable_language(CXX)
-set(CMAKE_CXX_STANDARD 14)
+# C++17: the vendored pico_shared usb_hid headers use inline static constexpr members.
+set(CMAKE_CXX_STANDARD 17)
+
+# When ON, doom_tiny is relinked into the pico-bootLoader app partition
+# (see cmake/BootPartition.cmake) and fruitjam_cflags.h picks a WHX
+# address safe for the bootloader flash map.
+option(BUILD_FOR_BOOTLOADER "Build doom_tiny for the pico-bootLoader" OFF)
+if(BUILD_FOR_BOOTLOADER)
+    add_compile_definitions(BUILD_FOR_BOOTLOADER=1)
+endif()
 
 if (PICO_SDK_PATH)
     # we are using git@github.com:liamfraser/tinyusb.git as it has some RP2040 fixes that aren't upstreamed yet
@@ -19,6 +28,14 @@ if (PICO_SDK_PATH)
     # this only affects device builds device, but we want to use zone for malloc in this case so we don't have two separate elastic spaces and can fit more in
     set(SKIP_PICO_MALLOC 1)
     pico_sdk_init()
+    # pico_generate_pio_header (used by our vendored pico_audio_i2s) is only
+    # registered by pico_sdk_init(), so add the driver subdir here.
+    if (PICO_ON_DEVICE)
+        # XInput host class driver (Xbox 360/One/Series, 8BitDo in X-mode),
+        # consumed by pico_shared_usb_hid.
+        add_subdirectory(3rdparty/tusb_xinput)
+    endif()
+    add_subdirectory(3rdparty/pico_shared_drivers)
     if (PICO_ON_DEVICE AND NOT CMAKE_BUILD_TYPE STREQUAL "MinSizeRel")
         message(WARNING "You should do a MinSizeRel build when targeting the RP2040
         (with -DCMAKE_BUILD_TYPE=MinSizeRel)")
@@ -54,9 +71,22 @@ endif()
 
 # Note PICO_SDK path is set by the SDK initialization if it occurs above
 if (NOT PICO_SDK)
-    find_package(SDL2 2.0.1 REQUIRED)
-    find_package(SDL2_mixer 2.0.0 REQUIRED)
-    find_package(SDL2_net 2.0.0 REQUIRED)
+    # SDL2 (+ mixer/net) are only needed for the native SDL builds
+    # (chocolate-doom, -setup, -server, midiread, mus2mid). The host-only
+    # whd_gen WAD tool needs none of them, so probe without REQUIRED and let
+    # configure succeed for a whd_gen-only build when they are absent.
+    find_package(SDL2 2.0.1)
+    find_package(SDL2_mixer 2.0.0)
+    find_package(SDL2_net 2.0.0)
+    if (SDL2_FOUND AND SDL2_MIXER_FOUND AND SDL2_NET_FOUND)
+        set(HAVE_SDL TRUE)
+    else()
+        set(HAVE_SDL FALSE)
+        message(STATUS "SDL2/SDL2_mixer/SDL2_net not all found: native SDL "
+                "targets disabled; only host tools (whd_gen) will build. Install "
+                "libsdl2-dev, libsdl2-mixer-dev and libsdl2-net-dev to build "
+                "chocolate-doom and friends.")
+    endif()
 
     # Check for libsamplerate.
     find_package(samplerate)
@@ -95,6 +125,14 @@ configure_file(src/resource.rc.in src/resource.rc)
 configure_file(src/setup-res.rc.in src/setup-res.rc)
 configure_file(src/setup/setup-manifest.xml.in src/setup/setup-manifest.xml)
 
-foreach(SUBDIR textscreen midiproc opl pcsound src)
+# textscreen/opl/pcsound link SDL2 (mixer) unconditionally in their native
+# branch, so only add them when SDL is available. src always builds — it hosts
+# the SDL-free whd_gen tool (its SDL games are gated on HAVE_SDL internally).
+if (PICO_SDK OR HAVE_SDL)
+    set(BUILD_SUBDIRS textscreen midiproc opl pcsound src)
+else()
+    set(BUILD_SUBDIRS src)
+endif()
+foreach(SUBDIR ${BUILD_SUBDIRS})
     add_subdirectory("${SUBDIR}")
 endforeach()

@@ -12,3 +12,6 @@
 [submodule "3rdparty/pico-extras"]
 	path = 3rdparty/pico-extras
 	url = https://github.com/raspberrypi/pico-extras.git
+[submodule "3rdparty/tusb_xinput"]
+	path = 3rdparty/tusb_xinput
+	url = https://github.com/fhoedemakers/tusb_xinput.git

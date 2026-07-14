@@ -25,6 +25,8 @@
 #endif
 #if USB_SUPPORT
 #include "tusb.h"
+// implemented in i_usbhid.cpp
+extern void pico_usb_hid_poll(void);
 #endif
 extern void I_InputInit();
 
@@ -490,6 +492,7 @@ void __attribute((noreturn)) I_Quit (void)
         I_GetEventTimeout(1000);
 #if USB_SUPPORT
         tuh_task();
+        pico_usb_hid_poll();
 #endif
 #endif
         I_UpdateSound();

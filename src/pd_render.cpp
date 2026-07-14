@@ -168,7 +168,6 @@ int pd_flag;
 fixed_t pd_scale;
 
 extern uint8_t __aligned(4) frame_buffer[2][SCREENWIDTH * MAIN_VIEWHEIGHT];
-extern uint8_t __aligned(4) stbar_fb[32];
 static uint8_t __aligned(4) visplane_bit[(SCREENWIDTH / 8) * MAIN_VIEWHEIGHT]; // this is also used for patch decoding in core1 (since flats are done by then)
 static int8_t flatnum_first[256];
 
@@ -2472,18 +2471,6 @@ void maybe_draw_single_screen(int patch_num) {
     }
 }
 
-void draw_stbar_on_framebuffer_pico(int frame, boolean refresh) {
-    V_BeginPatchList(vpatchlists->framebuffer);
-    // we call ST_drawwidgets directly as we don't want to mess with palette stuff (we call this during startup when not initialized)
-//    ST_Drawer(false, refresh);
-    ST_drawWidgets(refresh);
-    // draw the status bar onto the bottom (now non visible part of the top buffer)
-    I_VideoBuffer = stbar_fb - MAIN_VIEWHEIGHT * SCREENWIDTH; // what.
-    V_RestoreBuffer();
-    V_DrawPatchList(vpatchlists->framebuffer);
-    I_VideoBuffer = render_frame_buffer;
-}
-
 void draw_stbar_on_framebuffer(int frame, boolean refresh) {
     V_BeginPatchList(vpatchlists->framebuffer);
     // we call ST_drawwidgets directly as we don't want to mess with palette stuff (we call this during startup when not initialized)
@@ -2829,7 +2816,6 @@ if(USE_CORE1_FOR_FLATS || USE_CORE1_FOR_REGULAR) {
 //                if (!gametic)
 //                    break;
                 if (!wipestate) {
-                        draw_stbar_on_framebuffer_pico(render_frame_index, false);
                     if (automapactive)
                         AM_Drawer();
                     // goes into overlay set above

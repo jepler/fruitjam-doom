@@ -32,9 +32,41 @@
 
 #include "doomtype.h"
 #include "i_picosound.h"
-#include "pico/audio_i2s.h"
+// pico/audio.h from pico-extras is header-only; we keep it for the
+// audio_buffer_t type shape that opl_pico.c expects. We no longer link the
+// pico-extras I2S driver — audio is pushed via pico_shared's audio_i2s and
+// pico_hdmi_glue's HDMI data-island path.
+#include "pico/audio.h"
 #include "pico/binary_info.h"
 #include "hardware/gpio.h"
+
+#include "audio_i2s.h"                 // pico_shared: audio_i2s_setup / enqueue / mute
+#include "tlv320dac3100.h"             // enum headphone_toggle_t
+#include "pico_hdmi_glue.h"            // hstx_push_audio_sample, doom_audio_sink, doom_poll_headphone
+#include "hstx_data_island_queue.h"    // hstx_di_queue_get_level
+
+// Compile-time defs from 3rdparty/pico_shared_drivers/drivers/pico_hdmi/CMakeLists.txt.
+// Fall back to upstream defaults if this file is compiled without them.
+#ifndef HSTX_AUDIO_DI_HIGH_WATERMARK
+#define HSTX_AUDIO_DI_HIGH_WATERMARK 200
+#endif
+
+// Which audio_i2s driver this board carries — set in the board's force-included
+// <tag>_cflags.h as a numeric literal (1 = TLV320, 2 = PCM5000A, values from
+// audio_i2s.h). Defaults to the TLV320 (Fruit Jam) when a header predates the
+// multi-board split.
+#ifndef DOOM_AUDIO_I2S_DRIVER
+#define DOOM_AUDIO_I2S_DRIVER PICO_AUDIO_I2S_DRIVER_TLV320
+#endif
+
+// Headphone-detect is only available on the TLV320 with its INT pin wired
+// (Fruit Jam). Boards without it (PCM5100A boards, Feather's TLV320 breakout)
+// can't switch sinks at runtime, so they drive HDMI and I2S simultaneously.
+#if DOOM_AUDIO_I2S_DRIVER == PICO_AUDIO_I2S_DRIVER_TLV320 && PICO_AUDIO_I2S_INTERRUPT_PIN != -1
+#define DOOM_AUDIO_EXCLUSIVE_SINK 1
+#else
+#define DOOM_AUDIO_EXCLUSIVE_SINK 0
+#endif
 
 #define ADPCM_BLOCK_SIZE 128
 #define ADPCM_SAMPLES_PER_BLOCK_SIZE 249
@@ -65,7 +97,18 @@ struct channel_s
     int8_t decompressed[ADPCM_SAMPLES_PER_BLOCK_SIZE];
 };
 
-static struct audio_buffer_pool *producer_pool;
+// Doom hands the music generator a chunk-sized audio_buffer_t; we mix SFX
+// into the same buffer, then push samples to whichever sinks the routing
+// state currently selects (see doom_audio_sink in pico_hdmi_glue).
+//
+// Each I_Pico_UpdateSound() call produces at most MIX_CHUNK_SAMPLES stereo
+// samples → MIX_CHUNK_SAMPLES/4 HDMI DI packets (64) per burst, ~5.3 ms of
+// audio per call at 48 kHz. Must stay comfortably under both sinks' buffer
+// depths: I2S ring 1024 samples, DI ring HSTX_AUDIO_DI_HIGH_WATERMARK=224
+// packets (the DI gate below skips the mix cycle when a burst wouldn't fit).
+// pd_end_frame() spins on I_UpdateSound() while waiting for
+// display_frame_freed, so many calls per frame keep both sinks fed.
+#define MIX_CHUNK_SAMPLES 256
 
 static struct audio_format audio_format = {
         .format = AUDIO_BUFFER_FORMAT_PCM_S16,
@@ -76,6 +119,21 @@ static struct audio_format audio_format = {
 static struct audio_buffer_format producer_format = {
         .format = &audio_format,
         .sample_stride = 4
+};
+
+static int16_t mix_samples[MIX_CHUNK_SAMPLES * 2];  // stereo interleaved
+static mem_buffer_t mix_mem_buffer = {
+        .size = sizeof(mix_samples),
+        .bytes = (uint8_t *)mix_samples,
+        .flags = 0,
+};
+static audio_buffer_t mix_audio_buffer = {
+        .buffer = &mix_mem_buffer,
+        .format = &producer_format,
+        .sample_count = 0,
+        .max_sample_count = MIX_CHUNK_SAMPLES,
+        .user_data = 0,
+        .next = NULL,
 };
 
 // ====== FROM ADPCM-LIB =====
@@ -331,79 +389,145 @@ static void I_Pico_UpdateSound(void)
 {
     if (!sound_initialized) return;
 
-    // todo note this is called from D_Main around the game loop, which is fast enough now but may not be.
-    //  we can either poll more frequently, or use IRQ but then we have to be careful with threading (both OPL and channels)
-    // todo hopefully at least we can run the AI fast enough.
-    audio_buffer_t *buffer = take_audio_buffer(producer_pool, false);
-    if (buffer) {
-        if (music_generator) {
-            // todo think about volume; this already has a (<< 3) in it
-            music_generator(buffer);
-        } else {
-            memset(buffer->buffer->bytes, 0, buffer->buffer->size);
-        }
-        for(int ch=0; ch < NUM_SOUND_CHANNELS; ch++) {
-            if (is_channel_playing(ch)) {
-                channel_t *channel = &channels[ch];
-                assert(channel->decompressed_size);
-                int voll = channel->left/2;
-                int volr = channel->right/2;
-                uint offset_end = channel->decompressed_size * 65536;
-                assert(channel->offset < offset_end);
-                int16_t *samples = (int16_t *)buffer->buffer->bytes;
-#if SOUND_LOW_PASS
-                int alpha256 = channel->alpha256;
-                int beta256 = 256 - alpha256;
-                int sample = channel->decompressed[channel->offset >> 16];
-#endif
-                for(int s=0;s<buffer->max_sample_count;s++) {
-#if !SOUND_LOW_PASS
-                    int sample = channel->decompressed[channel->offset >> 16];
-#else
-                    // todo graham, note that since we are all at the same frequency (and it isn't the end
-                    //  of the world anyway, we could do this across all channels at once)
-                    sample = (beta256 * sample + alpha256 * channel->decompressed[channel->offset >> 16]) / 256;
-#endif
-                    *samples++ += sample * voll;
-                    *samples++ += sample * volr;
-                    channel->offset += channel->step;
-                    if (channel->offset >= offset_end) {
-                        channel->offset -= offset_end;
-                        decompress_buffer(channel);
-                        offset_end = channel->decompressed_size * 65536;
-                        if (channel->offset >= offset_end) {
-                            stop_channel(ch);
-                            break;
-                        }
-                    }
-                }
-            }
-        }
-        buffer->sample_count = buffer->max_sample_count;
-        if (fade_state == FS_SILENT) {
-            memset(buffer->buffer->bytes, 0, buffer->buffer->size);
-        } else if (fade_state != FS_NONE) {
-            int16_t *samples = (int16_t *)buffer->buffer->bytes;
-            int fade_step = fade_state == FS_FADE_IN ? FADE_STEP : -FADE_STEP;
-            int i;
-            for(i=0;i<buffer->sample_count * 2 && fade_level;i+=2) {
-                samples[i] = (samples[i] * (int)fade_level) >> 16;
-                samples[i+1] = (samples[i+1] * (int)fade_level) >> 16;
-                fade_level += fade_step;
-            }
-            if (!fade_level) {
-                if (fade_state == FS_FADE_OUT) {
-                    for(;i<buffer->sample_count * 2;i++) {
-                        samples[i] = 0;
-                    }
-                    fade_state = FS_SILENT;
-                } else {
-                    fade_state = FS_NONE;
-                }
-            }
-        }
-        give_audio_buffer(producer_pool, buffer);
+    // Poll headphone-detect (cheap; short-circuits if no IRQ latched). Runs
+    // here rather than from a timer so it stays on core0, where the TLV320
+    // register writes and speaker-mute path are safe to do.
+    doom_poll_headphone();
+
+    // Back-pressure: don't mix if the I2S ring is too full — the extra
+    // samples would just drop in audio_i2s_enqueue_sample(). Keep ~half the
+    // ring free so a burst of writes doesn't cause underflow if we get
+    // preempted.
+    if (audio_i2s_get_freebuffer_size() < MIX_CHUNK_SAMPLES) {
+        return;
     }
+
+    // HDMI DI-ring back-pressure: pd_end_frame() busy-loops calling
+    // I_UpdateSound(), each call packs MIX_CHUNK_SAMPLES/4 packets in one
+    // burst — much faster than the DI drain (~12 kpkt/s at 49716 Hz). If we
+    // push past HSTX_AUDIO_DI_HIGH_WATERMARK, hstx_push_audio_sample drops
+    // packets, which sounds like static on the HDMI sink. Skip this mix
+    // cycle when the DI ring can't absorb another full burst; the next call
+    // (microseconds later) retries after some drain.
+    if (doom_audio_sink == DOOM_SINK_HDMI) {
+        const uint32_t di_burst_packets = MIX_CHUNK_SAMPLES / 4;
+        if (hstx_di_queue_get_level() + di_burst_packets > HSTX_AUDIO_DI_HIGH_WATERMARK) {
+            return;
+        }
+    }
+
+    audio_buffer_t *buffer = &mix_audio_buffer;
+    if (music_generator) {
+        // todo think about volume; this already has a (<< 3) in it
+        music_generator(buffer);
+    } else {
+        memset(buffer->buffer->bytes, 0, buffer->buffer->size);
+    }
+    for(int ch=0; ch < NUM_SOUND_CHANNELS; ch++) {
+        if (is_channel_playing(ch)) {
+            channel_t *channel = &channels[ch];
+            assert(channel->decompressed_size);
+            int voll = channel->left/2;
+            int volr = channel->right/2;
+            uint offset_end = channel->decompressed_size * 65536;
+            assert(channel->offset < offset_end);
+            int16_t *samples = (int16_t *)buffer->buffer->bytes;
+#if SOUND_LOW_PASS
+            int alpha256 = channel->alpha256;
+            int beta256 = 256 - alpha256;
+            int sample = channel->decompressed[channel->offset >> 16];
+#endif
+            for(int s=0;s<buffer->max_sample_count;s++) {
+#if !SOUND_LOW_PASS
+                int sample = channel->decompressed[channel->offset >> 16];
+#else
+                sample = (beta256 * sample + alpha256 * channel->decompressed[channel->offset >> 16]) / 256;
+#endif
+                *samples++ += sample * voll;
+                *samples++ += sample * volr;
+                channel->offset += channel->step;
+                if (channel->offset >= offset_end) {
+                    channel->offset -= offset_end;
+                    decompress_buffer(channel);
+                    offset_end = channel->decompressed_size * 65536;
+                    if (channel->offset >= offset_end) {
+                        stop_channel(ch);
+                        break;
+                    }
+                }
+            }
+        }
+    }
+    buffer->sample_count = buffer->max_sample_count;
+    if (fade_state == FS_SILENT) {
+        memset(buffer->buffer->bytes, 0, buffer->buffer->size);
+    } else if (fade_state != FS_NONE) {
+        int16_t *samples = (int16_t *)buffer->buffer->bytes;
+        int fade_step = fade_state == FS_FADE_IN ? FADE_STEP : -FADE_STEP;
+        int i;
+        for(i=0;i<buffer->sample_count * 2 && fade_level;i+=2) {
+            samples[i] = (samples[i] * (int)fade_level) >> 16;
+            samples[i+1] = (samples[i+1] * (int)fade_level) >> 16;
+            fade_level += fade_step;
+        }
+        if (!fade_level) {
+            if (fade_state == FS_FADE_OUT) {
+                for(;i<buffer->sample_count * 2;i++) {
+                    samples[i] = 0;
+                }
+                fade_state = FS_SILENT;
+            } else {
+                fade_state = FS_NONE;
+            }
+        }
+    }
+
+    // Fan out per-sample to the currently-selected sink. Both the HDMI DI
+    // queue and the I2S ring accept int16 stereo; pack (L << 16) | R for
+    // pico_shared's audio_i2s.
+    //
+    // Design invariants (see plan / DC-offset section):
+    //   - HDMI sink active: we still enqueue zeros to I2S so BCLK keeps
+    //     toggling and the TLV320's PLL stays locked — otherwise the DAC
+    //     would pop on the next transition.
+    //   - I2S sink active: we stop pushing to HDMI. The DI queue falls back
+    //     to pre-encoded silence packets on underrun (hstx_data_island_queue),
+    //     which keeps ACR/AVI/audio-infoframe alive without our samples.
+    //
+    // Raw pass-through on both paths — DC-blocker + gain on the HDMI side
+    // was tried (mirroring pico-infonesPlus) and made no measurable
+    // difference to the observed broadband HDMI hiss. If HDMI needs it back,
+    // apply to the DAC's audio_i2s_setVolume() gain instead of the sample
+    // pipeline so both sinks stay bit-identical.
+    const int16_t *sp = (const int16_t *)buffer->buffer->bytes;
+    const uint32_t n = buffer->sample_count;
+#if DOOM_AUDIO_EXCLUSIVE_SINK
+    if (doom_audio_sink == DOOM_SINK_HEADPHONES) {
+        for (uint32_t s = 0; s < n; s++) {
+            int16_t l = *sp++;
+            int16_t r = *sp++;
+            audio_i2s_enqueue_sample(((uint32_t)(uint16_t)l << 16) | (uint16_t)r);
+        }
+    } else {
+        for (uint32_t s = 0; s < n; s++) {
+            int16_t l = *sp++;
+            int16_t r = *sp++;
+            hstx_push_audio_sample((int)l, (int)r);
+            audio_i2s_enqueue_sample(0);
+        }
+    }
+#else
+    // No headphone detect on this board: feed real samples to both sinks.
+    // doom_audio_sink stays at its DOOM_SINK_HDMI default, so the DI-ring
+    // back-pressure gate above still applies, and the I2S ring keeps its
+    // role as the mixer's pacing clock.
+    for (uint32_t s = 0; s < n; s++) {
+        int16_t l = *sp++;
+        int16_t r = *sp++;
+        hstx_push_audio_sample((int)l, (int)r);
+        audio_i2s_enqueue_sample(((uint32_t)(uint16_t)l << 16) | (uint16_t)r);
+    }
+#endif
 }
 
 static void I_Pico_ShutdownSound(void)
@@ -417,24 +541,33 @@ static void I_Pico_ShutdownSound(void)
 
 static boolean I_Pico_InitSound(boolean _use_sfx_prefix)
 {
-    int i;
     use_sfx_prefix = _use_sfx_prefix;
 
-    // todo this will likely need adjustment - maybe with IRQs/double buffer & pull from audio we can make it quite small
-    producer_pool = audio_new_producer_pool(&producer_format, 2, 1024); // todo correct size
-
-    struct audio_i2s_config config = {
-            .data_pin = PICO_AUDIO_I2S_DATA_PIN,
-            .clock_pin_base = PICO_AUDIO_I2S_CLOCK_PIN_BASE,
-            .dma_channel = 6,
-            .pio_sm = 0,
-    };
-
-    const struct audio_format *output_format;
-    output_format = audio_i2s_setup(&audio_format, &config);
-    if (!output_format) {
-        panic("PicoAudio: Unable to open audio device.\n");
+    // pico_shared: DAC register program (TLV320 boards) + I2S PIO/DMA +
+    // immediate silence pre-fill so BCLK is up and the DAC PLL locks before
+    // we push any real audio. The driver id comes from the board's cflags
+    // header. DMA channel must be >= 4 (see pico_hdmi_glue.h) so audio uses
+    // DMA_IRQ_1, keeping DMA_IRQ_0 exclusively for pico_hdmi.
+    audio_i2s_hw_t *i2s = audio_i2s_setup(DOOM_AUDIO_I2S_DRIVER,
+                                          PICO_SOUND_SAMPLE_FREQ,
+                                          /*dmachan=*/ 6);
+    if (!i2s) {
+        panic("PicoAudio: I2S setup failed (driver %d).\n", DOOM_AUDIO_I2S_DRIVER);
     }
+
+    // Speaker stays muted forever on Fruit Jam per project spec: with
+    // headphones out, HDMI is the sink; with headphones in, the DAC's
+    // headphone jack is the sink. The tlv320 driver defaults to speaker
+    // *unmuted* on cold boot, and toggles it on jack events. Force muted
+    // now so first-frame audio doesn't blast the internal speaker.
+    audio_i2s_muteInternalSpeaker(true);
+
+    // Boost DAC digital gain. tlv320_program_registers ships +5 dB (0x0A);
+    // Doom's mixer produces relatively low peak levels (SFX only reaches
+    // ~half full-scale before clipping, OPL is quieter still), so
+    // headphones read as too quiet. +14 dB (0x1C = 28 × 0.5 dB) gives
+    // comfortable listening without clipping on max-volume SFX.
+    audio_i2s_setVolume(14);
 
 #if INCREASE_I2S_DRIVE_STRENGTH
     bi_decl(bi_program_feature("12mA I2S"));
@@ -442,10 +575,6 @@ static boolean I_Pico_InitSound(boolean _use_sfx_prefix)
     gpio_set_drive_strength(PICO_AUDIO_I2S_CLOCK_PIN_BASE, GPIO_DRIVE_STRENGTH_12MA);
     gpio_set_drive_strength(PICO_AUDIO_I2S_CLOCK_PIN_BASE+1, GPIO_DRIVE_STRENGTH_12MA);
 #endif
-    // we want to pass thr
-    bool ok = audio_i2s_connect_extra(producer_pool, false, 0, 0, NULL);
-    assert(ok);
-    audio_i2s_set_enabled(true);
 
     sound_initialized = true;
     return true;

@@ -769,7 +769,7 @@ T get_field_inc(const std::vector<uint8_t> &data, int &offset) {
 }
 
 static void usage() {
-    throw std::invalid_argument("usage: whd_gen <wad_in> <whd_out>");
+    throw std::invalid_argument("usage: whd_gen <wad_in> <whd_out> [-no-super-tiny]\n");
 }
 
 std::set<std::string> music_lumpnames = {
@@ -4718,27 +4718,30 @@ std::vector<uint8_t> png_to_patch(wad& wad, const char *prefix, const char *name
 
 int main(int argc, const char **argv) {
     hash = 0;
-    int argn = 1;
-    auto next_arg = [&](bool required = true) {
-        if (argn >= argc) {
-            if (required) usage();
-            return (const char *)NULL;
-        }
-        if (!strcmp(argv[argn], "-no-super-tiny")) {
-            super_tiny = false;
-        }
-        return argv[argn++];
-    };
     try {
-        const char *wad_name = next_arg();
+        // Options may appear in any position; collect them separately from the
+        // positional arguments so `-no-super-tiny` is honoured whether it comes
+        // before, between, or after the <wad_in> <whd_out> filenames.
+        std::vector<const char *> positional;
+        for (int argn = 1; argn < argc; argn++) {
+            if (!strcmp(argv[argn], "-no-super-tiny")) {
+                super_tiny = false;
+            } else if (argv[argn][0] == '-') {
+                std::cerr << "unknown option: " << argv[argn] << "\n";
+                usage();
+            } else {
+                positional.push_back(argv[argn]);
+            }
+        }
+        if (positional.size() != 2) usage();
+        const char *wad_name = positional[0];
+        const char *output_filename = positional[1];
         auto wad = wad::read(wad_name);
         int size = 0;
         for(const auto &e : wad.get_lumps()) {
             size += e.second.data.size();
         }
         printf("LUMPS ORIG SIZE %d\n", size);
-        auto output_filename = next_arg();
-        next_arg(false); // check for more options
         const char *pos = std::max(strrchr(wad_name, '\\'), strrchr(wad_name, '/'));
         if (pos) pos++;
         else pos = wad_name;

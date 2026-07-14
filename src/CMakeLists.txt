@@ -1,9 +1,12 @@
 if (PICO_SDK)
     set(BINARIES doom)
-else()
+elseif (HAVE_SDL)
     # comment out heretic/hexen/strife for now, as whilst they may build, how well they work is unclear
 #    set(BINARIES doom heretic hexen strife setup)
     set(BINARIES doom setup)
+else()
+    # No SDL: build only the host tools (whd_gen); the SDL games are skipped.
+    set(BINARIES)
 endif()
 
 add_subdirectory(adpcm-xq)
@@ -46,7 +49,7 @@ endif()
 target_link_libraries(common INTERFACE common_${I_PLATFORM})
 
 # todo chocolate-server also doesn't currently build
-if (NOT PICO_SDK)
+if (NOT PICO_SDK AND HAVE_SDL)
     # Dedicated server (chocolate-server):
 
     set(DEDSERV_FILES
@@ -180,7 +183,7 @@ target_sources(game_deh INTERFACE
 
 target_link_libraries(game_deh INTERFACE game)
 
-if (NOT PICO_SDK)
+if (NOT PICO_SDK AND HAVE_SDL)
     set(EXTRA_LIBS SDL2::SDL2main SDL2::SDL2 SDL2::mixer SDL2::net textscreen pcsound)
     if(SAMPLERATE_FOUND)
         list(APPEND EXTRA_LIBS samplerate::samplerate)
@@ -486,6 +489,10 @@ function(add_doom_tiny SUFFIX RENDER_LIB)
         # Pico-PIO-USB has some use of floats. Rather than avoid it, just suck it up.
         #pico_set_float_implementation(doom_tiny${SUFFIX} none)
         pico_set_double_implementation(doom_tiny${SUFFIX} none)
+        if (BUILD_FOR_BOOTLOADER)
+            include(${CMAKE_SOURCE_DIR}/cmake/BootPartition.cmake)
+            frens_offset_for_bootloader(doom_tiny${SUFFIX})
+        endif()
         pico_add_extra_outputs(doom_tiny${SUFFIX})
     endif()
 
@@ -599,6 +606,13 @@ function(add_doom_tiny SUFFIX RENDER_LIB)
         )
         pico_enable_stdio_uart(doom_tiny${SUFFIX} 0)
     endif()
+    if (DOOM_NO_STDIO_UART)
+        # Boards whose default UART pins are wired to something else — e.g.
+        # the Murmulator M2's Wii I2C connector on GPIO 0/1. The matching
+        # cflags header also defines NO_USE_UART=1 for the C side (UART
+        # keyboard input in i_input.c), mirroring the PICO_HACK precedent.
+        pico_enable_stdio_uart(doom_tiny${SUFFIX} 0)
+    endif()
 endfunction()
 
 add_subdirectory(whd_gen)
@@ -627,6 +641,9 @@ else()
 endif()
 
 if (PICO_SDK)
+    # One consolidated target: doom_tiny.uf2 handles all inputs (USB keyboard,
+    # mouse and gamepads via the vendored pico_shared usb_hid driver). The old
+    # doom_tiny_nost / doom_tiny_usb / doom_tiny_nost_usb variants are gone.
     add_doom_tiny("" render_newhope)
     add_library(tiny_settings INTERFACE)
     target_compile_definitions(tiny_settings INTERFACE
@@ -636,29 +653,18 @@ if (PICO_SDK)
             NO_USE_FINALE_BUNNY=1
     )
     target_compile_definitions(doom_tiny PRIVATE
-            TINY_WAD_ADDR=0x10040000
+            # Overridden to 0x10080000 by fruitjam_cflags.h (and to 0x10400000
+            # for BUILD_FOR_BOOTLOADER); this default only matters for builds
+            # that don't -include that header.
+            TINY_WAD_ADDR=0x10048000
     )
     target_link_libraries(doom_tiny PRIVATE tiny_settings)
-    add_doom_tiny(_nost render_newhope)
-
-    target_compile_definitions(doom_tiny_nost PRIVATE
-            # NO_USE_FINALE_CAST=1 # note this is only used by doom II but doesnt take that much more space
-            TINY_WAD_ADDR=0x10048000
-            )
     if (PICO_ON_DEVICE)
         suppress_tinyusb_warnings()
-        add_doom_tiny(_usb render_newhope)
-        target_link_libraries(doom_tiny_usb PRIVATE tiny_settings pico_cd)
-        target_compile_definitions(doom_tiny_usb PRIVATE
+        target_link_libraries(doom_tiny PRIVATE pico_cd)
+        target_compile_definitions(doom_tiny PRIVATE
                 USB_SUPPORT=1
-                TINY_WAD_ADDR=0x10042000 # ugh tinyusb is >8K currently!!
         )
-        add_doom_tiny(_nost_usb render_newhope)
-        target_link_libraries(doom_tiny_nost_usb PRIVATE pico_cd)
-        target_compile_definitions(doom_tiny_nost_usb PRIVATE
-                USB_SUPPORT=1
-                TINY_WAD_ADDR=0x10048000
-                )
     endif()
 endif()
 

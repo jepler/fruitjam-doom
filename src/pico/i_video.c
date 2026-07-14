@@ -44,7 +44,8 @@
 #include "z_zone.h"
 
 #if USE_HSTX
-#include "../../Framebuffer_RP2350.c"
+#include "pico_hdmi_glue.h"
+#include "video_output.h"
 
 #if !PICO_ON_DEVICE
 #error Do not set USE_HSTX when !ON_DEVICE (only scanvideo is implemented)
@@ -67,7 +68,9 @@
 #if USE_HSTX
 #undef SUPPORT_TEXT
 #define SUPPORT_TEXT 0
-#define PICO_SCANVIDEO_PIXEL_FROM_RGB8(r,g,b) ((((r) >> 3) << 11) | (((g) >> 2) << 5) | ((b) >> 3))
+// pico_hdmi is configured for RGB555. Palette lookups produce 5-5-5 packed
+// as (R<<10)|(G<<5)|B; bit 15 stays zero.
+#define PICO_SCANVIDEO_PIXEL_FROM_RGB8(r,g,b) ((((r) >> 3) << 10) | (((g) >> 3) << 5) | ((b) >> 3))
 #else
 #include "video_doom.pio.h"
 #define SUPPORT_TEXT 1
@@ -144,7 +147,6 @@ unsigned int joywait = 0;
 pixel_t *I_VideoBuffer; // todo can't have this
 
 uint8_t __aligned(4) frame_buffer[2][SCREENWIDTH*MAIN_VIEWHEIGHT];
-uint8_t __aligned(4) stbar_fb[32*SCREENWIDTH];
 static uint16_t palette[256];
 static uint16_t __scratch_x("shared_pal") shared_pal[NUM_SHARED_PALETTES][16];
 static int8_t next_pal=-1;
@@ -577,8 +579,6 @@ static void __scratch_x("scanlines") scanline_func_double(uint32_t *dest, int sc
         const uint8_t *src = frame_buffer[display_frame_index] + scanline * SCREENWIDTH;
         palette_convert_scanline(dest, src);
     } else {
-        const uint8_t *src = stbar_fb + (scanline - MAIN_VIEWHEIGHT) * SCREENWIDTH;
-        palette_convert_scanline(dest, src);
         // we expect everything to be overdrawn by statusbar so we do nothing
     }
 }
@@ -765,7 +765,11 @@ static inline uint draw_vpatch(uint16_t *dest, patch_t *patch, vpatchlist_t *vp,
         assert(sp < NUM_SHARED_PALETTES);
         switch (vpatch_type(patch)) {
             case vp4_solid: {
-#if PICO_ON_DEVICE
+                // The XIP-stream prefetch below hid per-scanline flash latency in the
+                // scanvideo IRQ; the HSTX background task has ample budget, and skipping
+                // it keeps raw DMA channel 11 / XIP streaming away from the pico_hdmi
+                // and I2S drivers.
+#if PICO_ON_DEVICE && !USE_HSTX
                 if (patch == stbar) {
                     static const uint8_t *cached_data;
 #if PICO_RP2040
@@ -872,6 +876,42 @@ static inline uint draw_vpatch(uint16_t *dest, patch_t *patch, vpatchlist_t *vp,
         }
     }
     return data - data0;
+}
+
+// Composite the current frame's overlay vpatch list onto one scanline. Must be
+// called with ascending scanline numbers within a frame: the starter/next
+// linked lists (rebuilt each frame by new_frame_init_overlays_palette_and_wipe)
+// are consumed statefully, with per-patch data offsets carried in vpatch_doff.
+// Single caller per build (scanvideo fill_scanlines or the HSTX background
+// task), so it inlines and inherits the caller's section.
+static inline void composite_overlay_scanline(uint16_t *dest, int scanline) {
+    assert(scanline < count_of(vpatchlists->vpatch_starters));
+    int prev = 0;
+    for (int vp = vpatchlists->vpatch_starters[scanline]; vp;) {
+        int next = vpatchlists->vpatch_next[vp];
+        while (vpatchlists->vpatch_next[prev] && vpatchlists->vpatch_next[prev] < vp) {
+            prev = vpatchlists->vpatch_next[prev];
+        }
+        assert(prev != vp);
+        assert(vpatchlists->vpatch_next[prev] != vp);
+        vpatchlists->vpatch_next[vp] = vpatchlists->vpatch_next[prev];
+        vpatchlists->vpatch_next[prev] = vp;
+        prev = vp;
+        vp = next;
+    }
+    vpatchlist_t *overlays = vpatchlists->overlays[display_overlay_index];
+    prev = 0;
+    for (int vp = vpatchlists->vpatch_next[prev]; vp; vp = vpatchlists->vpatch_next[prev]) {
+        patch_t *patch = resolve_vpatch_handle(overlays[vp].entry.patch_handle);
+        int yoff = scanline - overlays[vp].entry.y;
+        if (yoff < vpatch_height(patch)) {
+            vpatchlists->vpatch_doff[vp] = draw_vpatch(dest, patch, &overlays[vp],
+                                                       vpatchlists->vpatch_doff[vp]);
+            prev = vp;
+        } else {
+            vpatchlists->vpatch_next[prev] = vpatchlists->vpatch_next[vp];
+        }
+    }
 }
 
 // this is not in flash as quite large and only once per frame
@@ -1003,66 +1043,83 @@ void __no_inline_not_in_flash_func(new_frame_stuff)() {
 #if SUPPORT_TEXT
 #error incompatible
 #endif
-void __scratch_x("scanlines") fill_scanlines_hstx() {
+
+// Intermediate 320×200 RGB555 framebuffer. Filled once per frame by the
+// background task (runs on core1's main loop, non-IRQ context) so the
+// per-scanline DMA IRQ only has to do a cheap 320-word h-double copy.
+//
+// The original single-callback design blew the 31.7 µs line budget on the
+// ~200 unique source rows per frame (palette conversion + h-double ≈ 34 µs
+// at 150 MHz clk_sys), which drifted the ping-pong DMA chain and tripped
+// the driver's over-rate / stuck-frame watchdog into a resync loop.
+//
+// Allocated from the zone (via malloc → PICO_HEAP_SIZE=0 → z_zone) at init
+// so it doesn't inflate .bss and push __end__ past SHORTPTR_BASE — the old
+// Framebuffer_RP2350.c did the same. Sized MAIN_VIEWHEIGHT + STATUSBAR rows
+// (168 + 32 = 200) to match Doom's paletted source.
+#define DOOM_RGB_FB_ROWS 200
+static uint16_t (*doom_rgb_fb)[SCREENWIDTH];
+
+// Vsync callback — runs in DMA_IRQ_0 on core1 at the start of vblank. Kept
+// minimal: we only latch a "fill needed" flag; the actual per-frame work
+// happens in the background task where it can afford the ~200×20 µs of
+// palette conversion without holding up DMA IRQ.
+static volatile bool doom_fb_fill_pending = false;
+
+void __not_in_flash_func(doom_hstx_vsync_cb)(void) {
+    doom_fb_fill_pending = true;
+}
+
+// Background task — runs in core1's main loop (video_output_core1_run,
+// after the watchdog check). Not in IRQ context, so semaphore ops, heavy
+// palette work, and even flash reads (e.g. W_CacheLumpNum on first call
+// if PLAYPAL wasn't pre-warmed) are safe. Fires once per vsync — we clear
+// the flag before doing the work so a vsync arriving mid-fill just marks
+// the next frame as pending and we catch up naturally.
+void __not_in_flash_func(doom_hstx_bg_task)(void) {
+    if (!doom_fb_fill_pending) return;
+    doom_fb_fill_pending = false;
+
+    new_frame_stuff();
+
+    if (!doom_rgb_fb) return;  // I_InitGraphics not finished yet
 #if USE_INTERP
-    need_save = interp_in_use;
+    // Per-core interp state; no one else on core1 touches it.
+    need_save = false;
     interp_updated = 0;
 #endif
-
-    int8_t frame = picodvi.frameno;
-    static uint8_t last_frame_number;
-    if (frame != last_frame_number) {
-        last_frame_number = frame;
-        new_frame_stuff();
-    }
-
-    for(uint32_t scanline = 0; scanline < 200; scanline++) {
-        uint32_t *line_data = &picodvi.framebuffer[160 * scanline];
-
-        DEBUG_PINS_SET(scanline_copy, 1);
-        if (display_video_type != VIDEO_TYPE_TEXT) {
-            // we don't have text mode -> normal transition yet, but we may for network game, so leaving this here - we would need to put the buffer pointers back
-            scanline_funcs[display_video_type](line_data, scanline);
-            if (0 && display_video_type >= FIRST_VIDEO_TYPE_WITH_OVERLAYS) {
-                assert(scanline < count_of(vpatchlists->vpatch_starters));
-                int prev = 0;
-                for (int vp = vpatchlists->vpatch_starters[scanline]; vp;) {
-                    int next = vpatchlists->vpatch_next[vp];
-                    while (vpatchlists->vpatch_next[prev] && vpatchlists->vpatch_next[prev] < vp) {
-                        prev = vpatchlists->vpatch_next[prev];
-                    }
-                    assert(prev != vp);
-                    assert(vpatchlists->vpatch_next[prev] != vp);
-                    vpatchlists->vpatch_next[vp] = vpatchlists->vpatch_next[prev];
-                    vpatchlists->vpatch_next[prev] = vp;
-                    prev = vp;
-                    vp = next;
-                }
-                vpatchlist_t *overlays = vpatchlists->overlays[display_overlay_index];
-                prev = 0;
-                for (int vp = vpatchlists->vpatch_next[prev]; vp; vp = vpatchlists->vpatch_next[prev]) {
-                    patch_t *patch = resolve_vpatch_handle(overlays[vp].entry.patch_handle);
-                    int yoff = scanline - overlays[vp].entry.y;
-                    if (yoff < vpatch_height(patch)) {
-                        vpatchlists->vpatch_doff[vp] = draw_vpatch((uint16_t*)(line_data), patch, &overlays[vp],
-                                                                   vpatchlists->vpatch_doff[vp]);
-                        prev = vp;
-                    } else {
-                        vpatchlists->vpatch_next[prev] = vpatchlists->vpatch_next[vp];
-                    }
-                }
-            }
-            DEBUG_PINS_CLR(scanline_copy, 1);
+    scanline_func fn = scanline_funcs[display_video_type];
+    bool overlays_on = display_video_type >= FIRST_VIDEO_TYPE_WITH_OVERLAYS;
+    for (int row = 0; row < DOOM_RGB_FB_ROWS; row++) {
+        if (fn) {
+            fn((uint32_t *)doom_rgb_fb[row], row);
         } else {
-            memset(line_data, 0x55, 320);
+            memset(doom_rgb_fb[row], 0, SCREENWIDTH * sizeof(uint16_t));
+        }
+        if (overlays_on) {
+            composite_overlay_scanline(doom_rgb_fb[row], row);
         }
     }
-#if USE_INTERP
-    if (interp_updated && need_save) {
-        interp_restore_static(interp0, &interp0_save);
-        interp_restore_static(interp1, &interp1_save);
+}
+
+// Scanline callback — runs in DMA_IRQ_0 on core1 once per active output
+// line. Maps 480 output lines onto 200 source rows (row = active_line *
+// 200 / 480) and h-doubles the pre-rendered doom_rgb_fb row into the
+// 640-pixel destination. No palette work here → ~13 µs, well under the
+// 31.7 µs line budget.
+void __not_in_flash_func(doom_hstx_scanline_cb)(uint32_t v_scanline, uint32_t active_line, uint32_t *line_buffer) {
+    if (active_line >= 480 || !doom_rgb_fb) {
+        memset(line_buffer, 0, MODE_H_ACTIVE_PIXELS * sizeof(uint16_t));
+        return;
     }
-#endif
+    int src_row = ((int)active_line * DOOM_RGB_FB_ROWS) / 480;
+    if (src_row < 0) src_row = 0;
+    else if (src_row >= DOOM_RGB_FB_ROWS) src_row = DOOM_RGB_FB_ROWS - 1;
+    const uint16_t *src = doom_rgb_fb[src_row];
+    for (uint i = 0; i < SCREENWIDTH; i++) {
+        uint32_t px = src[i];
+        line_buffer[i] = px | (px << 16);
+    }
 }
 
 #else
@@ -1092,33 +1149,7 @@ void __scratch_x("scanlines") fill_scanlines() {
             assert (buffer->data < text_scanline_buffer_start || buffer->data >= text_scanline_buffer_start + TEXT_SCANLINE_BUFFER_TOTAL_WORDS);
             scanline_funcs[display_video_type](buffer->data+1, scanline);
             if (display_video_type >= FIRST_VIDEO_TYPE_WITH_OVERLAYS) {
-                assert(scanline < count_of(vpatchlists->vpatch_starters));
-                int prev = 0;
-                for (int vp = vpatchlists->vpatch_starters[scanline]; vp;) {
-                    int next = vpatchlists->vpatch_next[vp];
-                    while (vpatchlists->vpatch_next[prev] && vpatchlists->vpatch_next[prev] < vp) {
-                        prev = vpatchlists->vpatch_next[prev];
-                    }
-                    assert(prev != vp);
-                    assert(vpatchlists->vpatch_next[prev] != vp);
-                    vpatchlists->vpatch_next[vp] = vpatchlists->vpatch_next[prev];
-                    vpatchlists->vpatch_next[prev] = vp;
-                    prev = vp;
-                    vp = next;
-                }
-                vpatchlist_t *overlays = vpatchlists->overlays[display_overlay_index];
-                prev = 0;
-                for (int vp = vpatchlists->vpatch_next[prev]; vp; vp = vpatchlists->vpatch_next[prev]) {
-                    patch_t *patch = resolve_vpatch_handle(overlays[vp].entry.patch_handle);
-                    int yoff = scanline - overlays[vp].entry.y;
-                    if (yoff < vpatch_height(patch)) {
-                        vpatchlists->vpatch_doff[vp] = draw_vpatch((uint16_t*)(buffer->data + 1), patch, &overlays[vp],
-                                                                   vpatchlists->vpatch_doff[vp]);
-                        prev = vp;
-                    } else {
-                        vpatchlists->vpatch_next[prev] = vpatchlists->vpatch_next[vp];
-                    }
-                }
+                composite_overlay_scanline((uint16_t *)(buffer->data + 1), scanline);
             }
             uint16_t *p = (uint16_t *) buffer->data;
             p[0] = video_doom_offset_raw_run;
@@ -1173,35 +1204,13 @@ static void __not_in_flash_func(free_buffer_callback)() {
 }
 #endif
 
-#if USE_HSTX
-#include "hardware/structs/hstx_ctrl.h"
-#include "hardware/structs/hstx_fifo.h"
-#endif
-
-volatile dma_hw_t *the_hw;  volatile dma_debug_hw_t *the_dbg; 
+#if !USE_HSTX
+volatile dma_hw_t *the_hw;  volatile dma_debug_hw_t *the_dbg;
 volatile hstx_ctrl_hw_t *the_ctrl;
 volatile hstx_fifo_hw_t *the_fifo;
 volatile hstx_fifo_hw_t *the_irqs;
 //static semaphore_t init_sem;
 static void core1() {
-#if USE_HSTX
-    the_hw = dma_hw;
-    the_dbg = dma_debug_hw; 
-    the_ctrl = hstx_ctrl_hw;
-    the_fifo = hstx_fifo_hw;
-    
-    if (!common_hal_picodvi_framebuffer_construct(&picodvi, 320, 240, HSTX_CKP, HSTX_D0P, HSTX_D1P, HSTX_D2P, 16)) {
-        printf("dvi init failed\n");
-        abort();
-    }
-    printf("dvi init complete\n");
-    sem_release(&core1_launch);
-    while (true) {
-        fill_scanlines_hstx();
-        // pd_core1_loop(); 
-    }
-#endif
-#else
 #if !PICO_ON_DEVICE
     void simulate_video_pio_video_doom(const uint32_t *dma_data, uint32_t dma_data_size,
                                        uint16_t *pixel_buffer, int32_t max_pixels, int32_t expected_width, bool overlay);
@@ -1229,12 +1238,32 @@ static void core1() {
         fill_scanlines();
 #endif
     }
-#endif
 }
+#endif  // !USE_HSTX (core1() only exists in the scanvideo path)
 
 #if PICO_RP2350
 #include "hardware/structs/accessctrl.h"
 #endif
+#if USE_HSTX
+// PICO_SOUND_SAMPLE_FREQ is set in i_picosound.h; both HSTX audio and I2S
+// audio run at the same rate.
+#include "i_picosound.h"
+
+// Pre-load the PLAYPAL lump on core0 before the HSTX driver starts hitting
+// new_frame_stuff() from its DMA IRQ. The static playpal pointer inside
+// new_frame_init_overlays_palette_and_wipe() would otherwise trigger a
+// W_CacheLumpNum call — and therefore a z_zone malloc — the first time a
+// gameplay frame arrives, in IRQ context on core1 after disallow_core1_malloc
+// has already been set.
+static void doom_hstx_prewarm_playpal(void)
+{
+    lumpindex_t l = W_GetNumForName("PLAYPAL");
+    if (l != -1) {
+        (void)W_CacheLumpNum(l, PU_STATIC);
+    }
+}
+#endif
+
 void I_InitGraphics(void)
 {
     stbar = resolve_vpatch_handle(VPATCH_STBAR);
@@ -1242,9 +1271,25 @@ void I_InitGraphics(void)
     sem_init(&display_frame_freed, 1, 2);
     sem_init(&core1_launch, 0, 1);
     pd_init();
+#if USE_HSTX
+    // Allocate the RGB555 intermediate framebuffer from the zone. Same trick
+    // the old Framebuffer_RP2350.c used — malloc() routes into z_zone here
+    // because PICO_HEAP_SIZE=0, so this 128 KB does NOT bloat .bss / push
+    // __end__ past SHORTPTR_BASE.
+    doom_rgb_fb = malloc(DOOM_RGB_FB_ROWS * SCREENWIDTH * sizeof(uint16_t));
+    if (!doom_rgb_fb) {
+        I_Error("doom_rgb_fb malloc(%d) failed",
+                DOOM_RGB_FB_ROWS * SCREENWIDTH * (int)sizeof(uint16_t));
+    }
+    memset(doom_rgb_fb, 0, DOOM_RGB_FB_ROWS * SCREENWIDTH * sizeof(uint16_t));
+
+    doom_hstx_prewarm_playpal();
+    doom_hdmi_init(doom_hstx_scanline_cb, doom_hstx_vsync_cb, doom_hstx_bg_task, PICO_SOUND_SAMPLE_FREQ);
+#else
     multicore_launch_core1(core1);
     // wait for core1 launch as it may do malloc and we have no mutex around that
     sem_acquire_blocking(&core1_launch);
+#endif
 #if USE_ZONE_FOR_MALLOC
     disallow_core1_malloc = true;
 #endif
@@ -1635,3 +1680,5 @@ void simulate_video_pio_video_doom(const uint32_t *dma_data, uint32_t dma_data_s
 }
 #endif
 #endif
+#endif // PICODOOM_RENDER_NEWHOPE
+

@@ -38,6 +38,8 @@
 #include "tusb.h"
 #include "hardware/irq.h"
 bi_decl(bi_program_feature("USB keyboard support"));
+// implemented in i_usbhid.cpp
+extern void pico_usb_hid_poll(void);
 #endif
 
 static const int scancode_translate_table[] = SCANCODE_TO_KEYS_ARRAY;
@@ -413,6 +415,7 @@ void I_InputInit(void) {
 void I_GetEvent() {
 #if USB_SUPPORT
     tuh_task();
+    pico_usb_hid_poll();
 #endif
     return I_GetEventTimeout(50);
 }
@@ -466,277 +469,43 @@ void I_GetEventTimeout(int key_timeout) {
 
 #if USB_SUPPORT
 
-#define MAX_REPORT  4
-#define debug_printf(fmt,...) ((void)0)
+// The TinyUSB HID host callbacks live in the vendored pico_shared usb_hid
+// driver (3rdparty/pico_shared_drivers/usb_hid/hid_app.cpp), which supports
+// keyboards, mice and a range of USB gamepads (DualShock 4/5, PSClassic,
+// Genesis Mini, MantaPad NES/SNES clones, XInput/Xbox, ...). i_usbhid.cpp
+// polls the state it maintains and reports back through the functions below.
 
-// Each HID instance can has multiple reports
-static struct
-{
-    uint8_t report_count;
-    tuh_hid_report_info_t report_info[MAX_REPORT];
-}hid_info[CFG_TUH_HID];
-
-static void process_kbd_report(hid_keyboard_report_t const *report);
-static void process_mouse_report(hid_mouse_report_t const * report);
-static void process_joystick_report(size_t len, const uint8_t *report);
-static void process_generic_report(uint8_t dev_addr, uint8_t instance, uint8_t const* report, uint16_t len);
-
-// Invoked when device with hid interface is mounted
-// Report descriptor is also available for use. tuh_hid_parse_report_descriptor()
-// can be used to parse common/simple enough descriptor.
-// Note: if report descriptor length > CFG_TUH_ENUMERATION_BUFSIZE, it will be skipped
-// therefore report_desc = NULL, desc_len = 0
-void tuh_hid_mount_cb(uint8_t dev_addr, uint8_t instance, uint8_t const* desc_report, uint16_t desc_len)
-{
-    debug_printf("HID device address = %d, instance = %d is mounted\r\n", dev_addr, instance);
-
-    // Interface protocol (hid_interface_protocol_enum_t)
-    const char* protocol_str[] = { "None", "Keyboard", "Mouse" };
-    uint8_t const itf_protocol = tuh_hid_interface_protocol(dev_addr, instance);
-    debug_printf("HID Interface Protocol = %s\r\n", protocol_str[itf_protocol]);
-//    printf("%d USB: device %d connected, protocol %s\n", time_us_32() - t0 , dev_addr, protocol_str[itf_protocol]);
-
-    // By default host stack will use activate boot protocol on supported interface.
-    // Therefore for this simple example, we only need to parse generic report descriptor (with built-in parser)
-    if ( itf_protocol == HID_ITF_PROTOCOL_NONE )
-    {
-        hid_info[instance].report_count = tuh_hid_parse_report_descriptor(hid_info[instance].report_info, MAX_REPORT, desc_report, desc_len);
-        debug_printf("HID has %u reports \r\n", hid_info[instance].report_count);
-    }
-
-    // request to receive report
-    // tuh_hid_report_received_cb() will be invoked when report is available
-    if ( !tuh_hid_receive_report(dev_addr, instance) )
-    {
-        debug_printf("Error: cannot request to receive report\r\n");
-    }
+void pico_usb_key_down(int scancode, int shift) {
+    pico_key_down(scancode, 0, shift ? WITH_SHIFT : 0);
 }
 
-// Invoked when device with hid interface is un-mounted
-void tuh_hid_umount_cb(uint8_t dev_addr, uint8_t instance)
-{
-    debug_printf("HID device address = %d, instance = %d is unmounted\r\n", dev_addr, instance);
-    printf("USB: device %d disconnected\n", dev_addr);
+void pico_usb_key_up(int scancode, int shift) {
+    pico_key_up(scancode, 0, shift ? WITH_SHIFT : 0);
 }
 
-// Invoked when received report from device via interrupt endpoint
-void tuh_hid_report_received_cb(uint8_t dev_addr, uint8_t instance, uint8_t const* report, uint16_t len)
-{
-    uint8_t const itf_protocol = tuh_hid_interface_protocol(dev_addr, instance);
+void pico_usb_post_joystick(int buttons, int xmove, int ymove, int strafemove) {
+    static event_t ev;
 
-    switch (itf_protocol)
-    {
-        case HID_ITF_PROTOCOL_KEYBOARD:
-            TU_LOG2("HID receive boot keyboard report\r\n");
-            process_kbd_report( (hid_keyboard_report_t const*) report );
-            break;
+    ev.type = ev_joystick;
+    ev.data1 = buttons;
+    ev.data2 = xmove;
+    ev.data3 = ymove;
+    ev.data4 = strafemove;
+    D_PostEvent(&ev);
+}
 
 #if !NO_USE_MOUSE
-            case HID_ITF_PROTOCOL_MOUSE:
-      TU_LOG2("HID receive boot mouse report\r\n");
-      process_mouse_report( (hid_mouse_report_t const*) report );
-    break;
-#endif
-
-        default:
-            // Generic report requires matching ReportID and contents with previous parsed report info
-            process_generic_report(dev_addr, instance, report, len);
-            break;
-    }
-
-    // continue to request to receive report
-    if ( !tuh_hid_receive_report(dev_addr, instance) )
-    {
-        debug_printf("Error: cannot request to receive report\r\n");
-    }
-}
-
-//--------------------------------------------------------------------+
-// Keyboard
-//--------------------------------------------------------------------+
-
-// look up new key in previous keys
-static inline bool find_key_in_report(hid_keyboard_report_t const *report, uint8_t keycode)
-{
-    for(uint8_t i=0; i<6; i++)
-    {
-        if (report->keycode[i] == keycode)  return true;
-    }
-
-    return false;
-}
-
-static void check_mod(int mod, int prev_mod, int mask, int scancode) {
-    if ((mod^prev_mod)&mask) {
-        if (mod & mask)
-            pico_key_down(scancode, 0, 0);
-        else
-            pico_key_up(scancode, 0, 0);
-    }
-}
-
-static void process_kbd_report(hid_keyboard_report_t const *report)
-{
-    static hid_keyboard_report_t prev_report = { 0, 0, {0} }; // previous report to check key released
-
-    //------------- example code ignore control (non-printable) key affects -------------//
-    for(uint8_t i=0; i<6; i++)
-    {
-        if ( report->keycode[i] )
-        {
-            if ( find_key_in_report(&prev_report, report->keycode[i]) )
-            {
-                // exist in previous report means the current key is holding
-            }else
-            {
-                // not existed in previous report means the current key is pressed
-                bool const is_shift = report->modifier & (KEYBOARD_MODIFIER_LEFTSHIFT | KEYBOARD_MODIFIER_RIGHTSHIFT);
-                pico_key_down(report->keycode[i], 0, is_shift ? WITH_SHIFT : 0);
-            }
-        }
-        // Check for key depresses (i.e. was present in prev report but not here)
-        if (prev_report.keycode[i]) {
-            // If not present in the current report then depressed
-            if (!find_key_in_report(report, prev_report.keycode[i]))
-            {
-                bool const is_shift = report->modifier & (KEYBOARD_MODIFIER_LEFTSHIFT | KEYBOARD_MODIFIER_RIGHTSHIFT);
-                pico_key_up(prev_report.keycode[i], 0, is_shift ? WITH_SHIFT : 0);
-            }
-        }
-    }
-    // synthesize events for modifier keys
-    static const uint8_t mods[] = {
-            KEYBOARD_MODIFIER_LEFTCTRL, SDL_SCANCODE_LCTRL,
-            KEYBOARD_MODIFIER_RIGHTCTRL, SDL_SCANCODE_RCTRL,
-            KEYBOARD_MODIFIER_LEFTALT, SDL_SCANCODE_LALT,
-            KEYBOARD_MODIFIER_RIGHTALT, SDL_SCANCODE_RALT,
-            KEYBOARD_MODIFIER_LEFTSHIFT, SDL_SCANCODE_LSHIFT,
-            KEYBOARD_MODIFIER_RIGHTSHIFT, SDL_SCANCODE_RSHIFT,
-    };
-    for(int i=0;i<count_of(mods); i+= 2) {
-        check_mod(report->modifier, prev_report.modifier, mods[i], mods[i+1]);
-    }
-    prev_report = *report;
-}
-
-//--------------------------------------------------------------------+
-// Mouse
-//--------------------------------------------------------------------+
-
-#if !NO_USE_MOUSE
-static void process_mouse_report(hid_mouse_report_t const * report)
-{
+void pico_usb_post_mouse(int buttons, int dx, int dy, int wheel) {
     static event_t ev;
 
     ev.type = ev_mouse;
-    ev.data1 = report->buttons;
-    ev.data2 = AccelerateMouse(report->x);
-    ev.data3 = AccelerateMouse(-report->y);
+    ev.data1 = buttons;
+    ev.data2 = AccelerateMouse(dx);
+    ev.data3 = AccelerateMouse(-dy);
     D_PostEvent(&ev);
 
-    // Neither of my two mice actually report anything in the "wheel" field
-    MapMouseWheelToButtons(report->buttons, report->wheel);
+    MapMouseWheelToButtons(buttons, wheel);
 }
 #endif
-
-static void process_joystick_report(size_t len, const uint8_t *report)
-{
-    static event_t ev;
-
-if (len != 8) return;
-
-#if 1
-    static uint8_t old_report[8];
-
-    if (memcmp(report, &old_report, sizeof(old_report))) {
-        memcpy(old_report, report, sizeof(old_report));
-        printf("%02x %02x %02x %02x %02x %02x %02x %02x\n",
-        report[0], report[1], report[2], report[3], report[4], report[5], report[6], report[7]);
-    }
-#endif
-
-    ev.type = ev_joystick;
-    ev.data1 = (report[5] >> 4) | (report[6] & 0xf0); // x a y b select start
-    ev.data2 = report[0] - 127; // X movement
-    ev.data3 = report[1] - 127; // Y movement
-    ev.data4 = (report[6] & 1 ? -127 : 0) + (report[6] & 2 ? 127 : 0); // strafe on shoulder buttons
-    D_PostEvent(&ev);
-}
-
-//--------------------------------------------------------------------+
-// Generic Report
-//--------------------------------------------------------------------+
-static void process_generic_report(uint8_t dev_addr, uint8_t instance, uint8_t const* report, uint16_t len)
-{
-    (void) dev_addr;
-
-    uint8_t const rpt_count = hid_info[instance].report_count;
-    tuh_hid_report_info_t* rpt_info_arr = hid_info[instance].report_info;
-    tuh_hid_report_info_t* rpt_info = NULL;
-
-    if ( rpt_count == 1 && rpt_info_arr[0].report_id == 0)
-    {
-        // Simple report without report ID as 1st byte
-        rpt_info = &rpt_info_arr[0];
-    }else
-    {
-        // Composite report, 1st byte is report ID, data starts from 2nd byte
-        uint8_t const rpt_id = report[0];
-
-        // Find report id in the arrray
-        for(uint8_t i=0; i<rpt_count; i++)
-        {
-            if (rpt_id == rpt_info_arr[i].report_id )
-            {
-                rpt_info = &rpt_info_arr[i];
-                break;
-            }
-        }
-
-        report++;
-        len--;
-    }
-
-    if (!rpt_info)
-    {
-        debug_printf("Couldn't find the report info for this report !\r\n");
-        return;
-    }
-
-    // For complete list of Usage Page & Usage checkout src/class/hid/hid.h. For examples:
-    // - Keyboard                     : Desktop, Keyboard
-    // - Mouse                        : Desktop, Mouse
-    // - Gamepad                      : Desktop, Gamepad
-    // - Consumer Control (Media Key) : Consumer, Consumer Control
-    // - System Control (Power key)   : Desktop, System Control
-    // - Generic (vendor)             : 0xFFxx, xx
-    if ( rpt_info->usage_page == HID_USAGE_PAGE_DESKTOP )
-    {
-        switch (rpt_info->usage)
-        {
-            case HID_USAGE_DESKTOP_KEYBOARD:
-                TU_LOG1("HID receive keyboard report\r\n");
-                // Assume keyboard follow boot report layout
-                process_kbd_report( (hid_keyboard_report_t const*) report );
-                break;
-
-#if !NO_USE_MOUSE
-            case HID_USAGE_DESKTOP_MOUSE:
-                TU_LOG1("HID receive mouse report\r\n");
-                // Assume mouse follow boot report layout
-                process_mouse_report( (hid_mouse_report_t const*) report );
-                break;
-#endif
-            case HID_USAGE_DESKTOP_JOYSTICK: // specific to https://www.adafruit.com/product/6285
-                TU_LOG1("HID receive joystick report\r\n");
-                process_joystick_report( (size_t) len, report );
-                break;
-
-            default:
-                printf("HID receive report usage=%d\r\n", rpt_info->usage);
-                break;
-        }
-    }
-}
 
 #endif

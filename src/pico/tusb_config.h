@@ -39,9 +39,17 @@
   #error CFG_TUSB_MCU must be defined
 #endif
 
-// Enable host stack with pio-usb if Pico-PIO-USB
+// Enable host stack. The USB transport follows the board's force-included
+// cflags header: HAS_USBPIO selects Pico-PIO-USB (Fruit Jam, Feather RP2350),
+// otherwise the RP2350's native USB controller is the host port
+// (adafruitdvisd, murmulatorm2). This header reaches every TU — including
+// tinyusb's — so hcd_rp2040.c / hcd_pio_usb.c select themselves off this.
 #define CFG_TUH_ENABLED     1
+#ifdef HAS_USBPIO
 #define CFG_TUH_RPI_PIO_USB 1
+#else
+#define CFG_TUH_RPI_PIO_USB 0
+#endif
 
 #if CFG_TUSB_MCU == OPT_MCU_LPC43XX || CFG_TUSB_MCU == OPT_MCU_LPC18XX || CFG_TUSB_MCU == OPT_MCU_MIMXRT10XX
   #define CFG_TUSB_RHPORT0_MODE       (OPT_MODE_HOST | OPT_MODE_HIGH_SPEED)
@@ -77,18 +85,22 @@
 //--------------------------------------------------------------------
 
 // Size of buffer to hold descriptors and other data used for enumeration
-#define CFG_TUH_ENUMERATION_BUFSIZE 128
+// (gamepad report descriptors can exceed 128 bytes)
+#define CFG_TUH_ENUMERATION_BUFSIZE 256
 
 #define CFG_TUH_HUB                 1
 #define CFG_TUH_CDC                 0
 #define CFG_TUH_MSC                 0
 #define CFG_TUH_VENDOR              0
 
+// XInput host class driver (3rdparty/tusb_xinput) for Xbox-style controllers
+#define CFG_TUH_XINPUT              1
+
 // max device support (excluding hub device)
 //#define CFG_TUH_DEVICE_MAX          (CFG_TUH_HUB ? 4 : 1) // hub typically has 4 ports
 // note tinyusb is very wasteful on space
 #define CFG_TUH_DEVICE_MAX          3
-#define CFG_TUH_HID                 4 // typical keyboard + mouse device can have 3-4 HID interfaces
+#define CFG_TUH_HID                 6 // keyboard + mouse + gamepad, some with several HID interfaces each
 //------------- HID -------------//
 #define CFG_TUH_HID_EPIN_BUFSIZE    64
 //#define CFG_TUH_HID_EPOUT_BUFSIZE   64

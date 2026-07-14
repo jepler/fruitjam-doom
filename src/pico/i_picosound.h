@@ -23,10 +23,16 @@
 #include "pico.h"
 typedef struct audio_buffer audio_buffer_t;
 
+// Allow the board-level cflags to force a specific sample rate (fruitjam_cflags.h
+// pins us to 44100 so pico_hdmi's ACR table has a matching entry — the emu8950
+// native 49716 Hz falls through to the 48 kHz default N/CTS and the sink hears
+// static from the constant FIFO overrun).
+#ifndef PICO_SOUND_SAMPLE_FREQ
 #if USE_EMU8950_OPL
 #define PICO_SOUND_SAMPLE_FREQ 49716
 #else
 #define PICO_SOUND_SAMPLE_FREQ 44100
+#endif
 #endif
 
 #ifndef NUM_SOUND_CHANNELS
